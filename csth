@@ -1,0 +1,125 @@
+import torch
+from torch import nn
+
+
+class sparseAttention(nn.Module):
+    def __init__(
+        self,
+        d_model: int,  # embedding dim
+        w: int,  # local sparse window size (excludes global tokens)
+        h: int,  # number of heads; ALWAYS d_model % h == 0
+        global_tokens_idx: torch.Tensor = torch.tensor([0]),  # absolute global token indices
+        max_len: int = 4096,  # max input sequence length
+        dialation: int = 1,  # dilation step for sparse margins
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.w = w
+        self.pad = w // 4
+        self.step = dialation
+        self.h = h
+        self.max_len = max_len
+
+        assert d_model % h == 0
+        self.d_h = d_model // h
+
+        # qkv and w_0 weights
+        self.w_qkv = nn.Parameter(torch.randn(h, 3 * self.d_h, d_model))
+        self.w_0 = nn.Parameter(torch.randn(d_model, d_model))
+        self.register_buffer("global_tokens", global_tokens_idx.to(torch.long))
+
+        # local sparse offsets:
+        # centre window: [-pad, ..., pad-1]  -> 2*pad tokens
+        # margins: pad tokens on each side with dilation step
+        centre = torch.arange(-self.pad, self.pad, dtype=torch.long)
+        left_margin = -self.pad - torch.arange(1, self.pad + 1, dtype=torch.long) * self.step
+        right_margin = (self.pad - 1) + torch.arange(1, self.pad + 1, dtype=torch.long) * self.step
+        rel_offsets = torch.cat((left_margin, centre, right_margin))
+        self.register_buffer("rel_offsets", rel_offsets)
+
+    def forward(self, x):
+        # x: [B, L, d_model]
+        B, L, _ = x.shape
+        assert L <= self.max_len
+
+        # global indices must be valid for current sequence length
+        valid_global = self.global_tokens[
+            (self.global_tokens >= 0) & (self.global_tokens < L)
+        ].to(x.device)
+        global_mask = torch.zeros(L, dtype=torch.bool, device=x.device)
+        if valid_global.numel() > 0:
+            global_mask[valid_global] = True
+        local_mask = ~global_mask
+
+        # obtain q, k, v: each [B, h, L, d_h]
+        q, k, v = torch.einsum("bld,hkd->bhlk", x, self.w_qkv).chunk(3, dim=-1)
+
+        # build sparse indices for local queries: relative local+dilated + absolute global
+        base = torch.arange(L, device=x.device)[:, None]
+        rel_idx = (base + self.rel_offsets.to(x.device)[None, :]).clamp_(0, L - 1)
+        if valid_global.numel() > 0:
+            glo_idx = valid_global[None, :].expand(L, -1)
+            sparse_idx = torch.cat((rel_idx, glo_idx), dim=1)
+        else:
+            sparse_idx = rel_idx
+
+        A = torch.zeros(B, self.h, L, self.d_h, device=x.device, dtype=x.dtype)
+
+        def run_local_attention():
+            local_idx = sparse_idx[local_mask]  # [L_local, W]
+            k_local = k[:, :, local_idx, :]  # [B, h, L_local, W, d_h]
+            v_local = v[:, :, local_idx, :]
+            q_local = q[:, :, local_mask, :]  # [B, h, L_local, d_h]
+
+            scores_local = torch.einsum("bhld,bhlwd->bhlw", q_local, k_local) / (self.d_h ** 0.5)
+            probs_local = torch.softmax(scores_local, dim=-1)
+            return torch.einsum("bhlw,bhlwd->bhld", probs_local, v_local)
+
+        def run_global_attention():
+            q_global = q[:, :, global_mask, :]  # [B, h, L_global, d_h]
+            scores_global = torch.einsum("bhld,bhmd->bhlm", q_global, k) / (self.d_h ** 0.5)
+            probs_global = torch.softmax(scores_global, dim=-1)
+            return torch.einsum("bhlm,bhmd->bhld", probs_global, v)
+
+        # CPU path: keep sequential execution.
+        if not x.is_cuda:
+            if local_mask.any():
+                A[:, :, local_mask, :] = run_local_attention()
+            if global_mask.any():
+                A[:, :, global_mask, :] = run_global_attention()
+
+            out = A.transpose(1, 2).reshape(B, L, self.h * self.d_h)
+            return out @ self.w_0
+
+        # CUDA path: run local and global blocks on separate streams.
+        current_stream = torch.cuda.current_stream(device=x.device)
+        local_stream = torch.cuda.Stream(device=x.device)
+        global_stream = torch.cuda.Stream(device=x.device)
+
+        local_out = None
+        global_out = None
+
+        if local_mask.any():
+            local_stream.wait_stream(current_stream)
+            with torch.cuda.stream(local_stream):
+                local_out = run_local_attention()
+
+        if global_mask.any():
+            global_stream.wait_stream(current_stream)
+            with torch.cuda.stream(global_stream):
+                global_out = run_global_attention()
+
+        current_stream.wait_stream(local_stream)
+        current_stream.wait_stream(global_stream)
+
+        if local_out is not None:
+            A[:, :, local_mask, :] = local_out
+        if global_out is not None:
+            A[:, :, global_mask, :] = global_out
+
+        out = A.transpose(1, 2).reshape(B, L, self.h * self.d_h)
+        return out @ self.w_0
+
+
+sta = sparseAttention(d_model=512, w=16, h=8)
+print(sta.forward(torch.randn(4, 150, 512)).shape)
