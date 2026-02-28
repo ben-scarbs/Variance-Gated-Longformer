@@ -43,14 +43,7 @@ class sparseAttention(nn.Module):
         assert L <= self.max_len
 
         # global indices must be valid for current sequence length.
-        # Supports per-batch [B, G] or shared [G] buffers.
-        global_tokens = self.global_tokens.to(x.device)
-        if global_tokens.dim() == 1:
-            global_tokens = global_tokens.unsqueeze(0).expand(B, -1)
-        elif global_tokens.dim() == 2 and global_tokens.size(0) == 1:
-            global_tokens = global_tokens.expand(B, -1)
-        elif global_tokens.dim() != 2 or global_tokens.size(0) != B:
-            raise ValueError("global_tokens must have shape [G], [1, G], or [B, G].")
+        global_tokens = self.global_tokens.to(x.device) # [B,G]
 
         valid_global = (global_tokens >= 0) & (global_tokens < L)  # [B, G]
         global_tokens_safe = global_tokens.masked_fill(~valid_global, 0)
@@ -60,7 +53,7 @@ class sparseAttention(nn.Module):
             global_mask.scatter_(1, global_tokens_safe, valid_global)
         local_mask = ~global_mask
 
-        # obtain q, k, v: each [B, h, L, d_h]
+        # q, k, v: [B, h, L, d_h]
         q, k, v = torch.einsum("bld,hkd->bhlk", x, self.w_qkv).chunk(3, dim=-1)
 
         # build sparse indices for local queries: relative local+dilated + absolute global
@@ -133,7 +126,7 @@ class sparseAttention(nn.Module):
             out = A.transpose(1, 2).reshape(B, L, self.h * self.d_h)
             return out @ self.w_0, future_globals
 
-        # CUDA path: run local and global blocks on separate streams.
+        # CUDA path: run local and global blocks on separate streams for async computation.
         current_stream = torch.cuda.current_stream(device=x.device)
         local_stream = torch.cuda.Stream(device=x.device)
         global_stream = torch.cuda.Stream(device=x.device)
@@ -160,5 +153,3 @@ class sparseAttention(nn.Module):
         return out @ self.w_0, future_globals
 
 
-sta = sparseAttention(d_model=512, w=16, h=8).forward(torch.randn(4, 150, 512))
-print(sta[0].shape, sta[1].shape)
