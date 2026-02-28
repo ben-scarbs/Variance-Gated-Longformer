@@ -210,6 +210,26 @@ class VarGatedResidual(nn.Module):
         return x * gate.unsqueeze(-1)   # [B, L, d_model]
 
 
+class SwiGLUFFN(nn.Module):
+    def __init__(
+        self,
+        d_model,
+        d_ff,
+        dropout=0.0
+    ):
+        super().__init__()
+        self.w = nn.parameter(torch.randn(d_model, d_ff*2))
+        self.w_out = nn.Linear(d_ff, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        #   x: [B, L, d_model]
+        w1, w2 = (x @ self.w).chunk(2, dim=-1)  # 2*[B, L, d_ff]
+        x = F.silu(w1) * w2 # [B, L, d_ff]
+        x = self.dropout(x)
+        return self.w_out(x)    # [B, L, d_model]
+
+
 class sparseTransformerLayer(nn.module):
     def __init__(
         self,
@@ -220,7 +240,7 @@ class sparseTransformerLayer(nn.module):
         dilation: int,
         # MLP params
         dropout: float = 0.0,
-        hidden_ratio: float = 2.0
+        hidden_ratio: float = 7/3
     ):
         super().__init__()
         self.sparseAttention = sparseAttention(
@@ -231,13 +251,7 @@ class sparseTransformerLayer(nn.module):
         )
 
         hidden_dim = int(hidden_ratio * d_model)
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, d_model),
-            nn.Dropout(dropout),
-        )
+        self.FFN = SwiGLUFFN(d_model=d_model, d_ff=hidden_dim, dropout=dropout)
 
         self.residual1 = VarGatedResidual()
         self.residual2 = VarGatedResidual()
@@ -250,9 +264,9 @@ class sparseTransformerLayer(nn.module):
         sub1 = self.norm1(x)
         sub1 = self.sparseAttention(sub1)
         sub1 = x + self.residual1(sub1)
-        #   Sublayer 2 (FFN/MLP)
+        #   Sublayer 2 (FFN)
         sub2 = self.norm2(sub2)
-        sub2 = self.mlp(sub2)
+        sub2 = self.FFN(sub2)
         sub2 = self.residual2(sub2)
         return sub2 + sub1
 
