@@ -1,6 +1,7 @@
 import math
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 
 class sparseAttention(nn.Module):
@@ -153,3 +154,53 @@ class sparseAttention(nn.Module):
         return out @ self.w_0, future_globals
 
 
+
+class VarGatedResidual(nn.Module):
+    """
+    Residual scaling using:
+      - sequence-level variance
+      - token cosine distance from sequence mean
+
+    x: [batch, seq_len, embedding_dim]
+    """
+    def __init__(
+            self, dim, alpha=0.5, beta=0.5
+            ):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.tensor(alpha))
+        self.beta = nn.Parameter(torch.tensor(beta))
+        self.dim = dim
+
+    def forward(self, x):
+        # x: [B, L, d_model]
+        B, L, d_model = x.shape
+
+        # ---- sequence mean ----
+        mu = x.mean(dim=1, keepdim=True)  # [B, 1, d_model]
+
+        # ---- cosine distance per token ----
+        x_norm = F.normalize(x, dim=-1)
+        mu_norm = F.normalize(mu, dim=-1)
+
+        cos_sim = (x_norm * mu_norm).sum(dim=-1)  # [B, L]
+        d = 1.0 - cos_sim                         # [B, L]
+
+        # normalise token distances (mean ≈ 1)
+        d_mean = d.mean(dim=1, keepdim=True)
+        d_norm = d / (d_mean + 1e-6)          # [B, L]
+
+        # ---- sequence variance across tokens ----
+        var_seq = x.var(dim=1, unbiased=False)    # [B, d_model]
+        var_seq = var_seq.mean(dim=-1)            # [B]
+
+        # normalize sequence variance
+        var_mean = var_seq.mean(dim=0, keepdim=True)
+        s_norm = var_seq / (var_mean + 1e-6)  # [B]
+
+        # expand to tokens
+        s_norm = s_norm.unsqueeze(1).expand(B, L)  # [B, L]
+
+        # ---- combined gate ----
+        gate = 1.0 + self.alpha * d_norm + self.beta * s_norm  # [B, L]
+
+        return x * gate.unsqueeze(-1)   # [B, L, d_model]
