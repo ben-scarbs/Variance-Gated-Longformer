@@ -1,3 +1,6 @@
+#----Convolutioal Sparse Attention Transformer Hybrid----
+#   Inspired by Longformer
+
 import math
 import torch
 from torch import nn
@@ -7,18 +10,18 @@ import torch.nn.functional as F
 class sparseAttention(nn.Module):
     def __init__(
         self,
-        d_model: int,  # embedding dim
-        w: int,  # local sparse window size (excludes global tokens)
-        h: int,  # number of heads; ALWAYS d_model % h == 0
+        d_model: int = 512,  # embedding dim
+        w: int = 128,  # local sparse window size (excludes global tokens)
+        h: int = 8,  # number of heads; ALWAYS d_model % h == 0
         global_tokens_idx: torch.Tensor = torch.zeros(1,1, dtype=torch.long),  # absolute global token indices
         max_len: int = 4096,  # max input sequence length
-        dialation: int = 1,  # dilation step for sparse margins
+        dilation: int = 1,  # dilation step for sparse margins
     ):
         super().__init__()
         self.d_model = d_model
         self.w = w
         self.pad = w // 4
-        self.step = dialation
+        self.step = dilation
         self.h = h
         self.max_len = max_len
         assert d_model % h == 0
@@ -164,12 +167,13 @@ class VarGatedResidual(nn.Module):
     x: [batch, seq_len, embedding_dim]
     """
     def __init__(
-            self, dim, alpha=0.5, beta=0.5
-            ):
+        self,
+        alpha=0.5,
+        beta=0.3
+    ):
         super().__init__()
         self.alpha = nn.Parameter(torch.tensor(alpha))
         self.beta = nn.Parameter(torch.tensor(beta))
-        self.dim = dim
 
     def forward(self, x):
         # x: [B, L, d_model]
@@ -204,3 +208,52 @@ class VarGatedResidual(nn.Module):
         gate = 1.0 + self.alpha * d_norm + self.beta * s_norm  # [B, L]
 
         return x * gate.unsqueeze(-1)   # [B, L, d_model]
+
+
+class sparseTransformerLayer(nn.module):
+    def __init__(
+        self,
+        # Attention params
+        d_model: int,
+        w: int,
+        global_tokens: torch.Tensor,
+        dilation: int,
+        # MLP params
+        dropout: float = 0.0,
+        hidden_ratio: float = 2.0
+    ):
+        super().__init__()
+        self.sparseAttention = sparseAttention(
+            d_model = d_model,
+            w = w,
+            global_tokens_idx = global_tokens,
+            dilation = dilation
+        )
+
+        hidden_dim = int(hidden_ratio * d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, d_model),
+            nn.Dropout(dropout),
+        )
+
+        self.residual1 = VarGatedResidual()
+        self.residual2 = VarGatedResidual()
+
+        self.norm1 = nn.RMSNorm(d_model)
+        self.norm2 = nn.RMSNorm(d_model)
+
+    def forward(self, x):
+        #   Sublayer 1 (Attention)
+        sub1 = self.norm1(x)
+        sub1 = self.sparseAttention(sub1)
+        sub1 = x + self.residual1(sub1)
+        #   Sublayer 2 (FFN/MLP)
+        sub2 = self.norm2(sub2)
+        sub2 = self.mlp(sub2)
+        sub2 = self.residual2(sub2)
+        return sub2 + sub1
+
+
