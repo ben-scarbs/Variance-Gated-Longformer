@@ -1,5 +1,6 @@
-#----Convolutioal Sparse Attention Transformer Hybrid----
+#----Sparse Attention Transformer----
 #   Inspired by Longformer
+#   Uses variance dependant gated residuals and SwiGLU FFN sublayer
 
 import math
 import torch
