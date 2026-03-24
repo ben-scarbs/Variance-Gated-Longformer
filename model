@@ -1,6 +1,7 @@
-#----Sparse Attention Transformer----
+#----Sparse Attention Transformer Model----
 #   Inspired by Longformer
-#   Uses variance dependant gated residuals and SwiGLU FFN sublayer
+#   Uses windowed sparse attention with marginal dilation and selected global tokens
+#   Additionally, uses variance dependant gated residuals and SwiGLU FFN sublayer
 
 import math
 import torch
@@ -15,7 +16,6 @@ class sparseAttention(nn.Module):
         w: int = 128,  # local sparse window size (excludes global tokens)
         h: int = 8,  # number of heads; ALWAYS d_model % h == 0
         global_tokens_idx: torch.Tensor = torch.zeros(1,1, dtype=torch.long),  # absolute global token indices
-        max_len: int = 4096,  # max input sequence length
         dilation: int = 1,  # dilation step for sparse margins
     ):
         super().__init__()
@@ -24,9 +24,9 @@ class sparseAttention(nn.Module):
         self.pad = w // 4
         self.step = dilation
         self.h = h
-        self.max_len = max_len
         assert d_model % h == 0
         self.d_h = d_model // h
+        self.global_tokens = global_tokens_idx
 
         # qkv and w_0 weights
         self.w_qkv = nn.Parameter(torch.randn(h, 3 * self.d_h, d_model))
@@ -45,12 +45,11 @@ class sparseAttention(nn.Module):
     def forward(self, x):
         # x: [B, L, d_model]
         B, L, _ = x.shape
-        assert L <= self.max_len
 
         # global indices must be valid for current sequence length.
         global_tokens = self.global_tokens.to(x.device) # [B,G]
 
-        valid_global = (global_tokens >= 0) & (global_tokens < L)  # [B, G]
+        valid_global = (global_tokens >= 0) & (global_tokens < L)  # [B, G] (bool)
         global_tokens_safe = global_tokens.masked_fill(~valid_global, 0)
 
         global_mask = torch.zeros(B, L, dtype=torch.bool, device=x.device)
@@ -77,11 +76,9 @@ class sparseAttention(nn.Module):
             sparse_valid = rel_valid
 
         A = torch.zeros(B, self.h, L, self.d_h, device=x.device, dtype=x.dtype)
-        k_top = min(max(1, math.ceil(math.log(max(L, 2)))), L)
-        future_globals = torch.zeros(B, k_top, dtype=torch.long, device=x.device)
 
         S = sparse_idx.size(-1)
-        neg_large = torch.finfo(x.dtype).min
+        neg_large = torch.finfo(x.dtype).min    # Finds the min value for x.dtype for masking.
         local_query_mask = local_mask.unsqueeze(1).unsqueeze(-1).to(x.dtype)  # [B, 1, L, 1]
 
         # Flatten [B, L] into a single axis to gather sparse keys/values without loops.
@@ -115,21 +112,15 @@ class sparseAttention(nn.Module):
 
             global_out = torch.zeros_like(q)
             global_out.scatter_add_(dim=2, index=idx_global, src=global_values)
-
-            importance = (scores_global * valid_query.to(scores_global.dtype)).sum(dim=(1, 2))  # [B, L]
-            has_global = valid_global.any(dim=1)
-            next_globals = torch.zeros(B, k_top, dtype=torch.long, device=x.device)
-            if bool(has_global.any().item()):
-                next_globals[has_global] = importance[has_global].topk(k=k_top, dim=-1).indices
-            return global_out, next_globals
+            return global_out
 
         # CPU path: keep sequential execution.
         if not x.is_cuda:
             local_out = run_local_attention()
-            global_out, future_globals = run_global_attention()
+            global_out = run_global_attention()
             A = torch.where(global_mask.unsqueeze(1).unsqueeze(-1), global_out, local_out)
             out = A.transpose(1, 2).reshape(B, L, self.h * self.d_h)
-            return out @ self.w_0, future_globals
+            return out @ self.w_0
 
         # CUDA path: run local and global blocks on separate streams for async computation.
         current_stream = torch.cuda.current_stream(device=x.device)
@@ -138,7 +129,6 @@ class sparseAttention(nn.Module):
 
         local_out = None
         global_out = None
-        global_future = future_globals
 
         local_stream.wait_stream(current_stream)
         with torch.cuda.stream(local_stream):
@@ -146,16 +136,15 @@ class sparseAttention(nn.Module):
 
         global_stream.wait_stream(current_stream)
         with torch.cuda.stream(global_stream):
-            global_out, global_future = run_global_attention()
+            global_out = run_global_attention()
 
         current_stream.wait_stream(local_stream)
         current_stream.wait_stream(global_stream)
 
         A = torch.where(global_mask.unsqueeze(1).unsqueeze(-1), global_out, local_out)
-        future_globals = global_future
 
         out = A.transpose(1, 2).reshape(B, L, self.h * self.d_h)
-        return out @ self.w_0, future_globals
+        return out @ self.w_0
 
 
 
