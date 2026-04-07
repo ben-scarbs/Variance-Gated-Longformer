@@ -17,6 +17,8 @@ class sparseAttention(nn.Module):
         h: int = 8,  # number of heads; ALWAYS d_model % h == 0
         global_tokens_idx: torch.Tensor = torch.zeros(1,1, dtype=torch.long),  # absolute global token indices
         dilation: int = 1,  # dilation step for sparse margins
+        next_global_k: int = 0,  # number of global tokens to route to the next layer
+        carryover_global_k: int = 0,  # number of current globals to preserve into the next layer
     ):
         super().__init__()
         self.d_model = d_model
@@ -26,12 +28,13 @@ class sparseAttention(nn.Module):
         self.h = h
         assert d_model % h == 0
         self.d_h = d_model // h
-        self.global_tokens = global_tokens_idx
+        self.next_global_k = next_global_k
+        self.carryover_global_k = carryover_global_k
 
         # qkv and w_0 weights
         self.w_qkv = nn.Parameter(torch.randn(h, 3 * self.d_h, d_model))
         self.w_0 = nn.Parameter(torch.randn(d_model, d_model))
-        self.register_buffer("global_tokens", global_tokens_idx.to(torch.long))
+        self.register_buffer("default_global_tokens", global_tokens_idx.to(torch.long))
 
         # local sparse offsets:
         # centre window: [-pad, ..., pad-1]  -> 2*pad tokens
@@ -42,12 +45,99 @@ class sparseAttention(nn.Module):
         rel_offsets = torch.cat((left_margin, centre, right_margin))
         self.register_buffer("rel_offsets", rel_offsets)
 
-    def forward(self, x):
+    def _resolve_global_tokens(self, global_tokens_idx, batch_size, device):
+        global_tokens = self.default_global_tokens if global_tokens_idx is None else global_tokens_idx
+        global_tokens = global_tokens.to(device=device, dtype=torch.long)
+
+        if global_tokens.dim() == 1:
+            global_tokens = global_tokens.unsqueeze(0)
+
+        if global_tokens.size(0) == 1 and batch_size > 1:
+            global_tokens = global_tokens.expand(batch_size, -1)
+        elif global_tokens.size(0) != batch_size:
+            raise ValueError(
+                f"Expected global token indices for batch size {batch_size}, got {global_tokens.size(0)}"
+            )
+
+        return global_tokens
+
+    def _pad_selected_tokens(self, indices, total_k):
+        if indices.size(1) >= total_k:
+            return indices[:, :total_k]
+
+        pad = indices.new_full((indices.size(0), total_k - indices.size(1)), -1)
+        return torch.cat((indices, pad), dim=1)
+
+    def _pack_valid_tokens(self, indices):
+        if indices.numel() == 0:
+            return indices
+
+        B, N = indices.shape
+        device = indices.device
+        is_invalid = indices.lt(0)
+        positions = torch.arange(N, device=device).unsqueeze(0).expand(B, -1)
+        order = torch.argsort(is_invalid.to(torch.long) * N + positions, dim=1)
+        return indices.gather(1, order)
+
+    def _select_next_global_tokens(self, probs_global, global_tokens_safe, valid_global):
+        if self.next_global_k <= 0:
+            return None
+
+        B, _, G, L = probs_global.shape
+        device = probs_global.device
+        neg_large = torch.finfo(probs_global.dtype).min
+
+        received_scores = probs_global.mean(dim=1)  # [B, G, L]
+
+        if G > 0:
+            self_mask = torch.zeros(B, G, L, dtype=torch.bool, device=device)
+            self_mask.scatter_(2, global_tokens_safe.unsqueeze(-1), valid_global.unsqueeze(-1))
+            received_scores = received_scores.masked_fill(self_mask, 0.0)
+
+        valid_query_count = valid_global.sum(dim=1, keepdim=True).clamp_min(1).to(received_scores.dtype)
+        token_scores = received_scores.sum(dim=1) / valid_query_count  # [B, L]
+
+        carry_k = min(self.carryover_global_k, self.next_global_k, G)
+        carried_idx = global_tokens_safe.new_empty(B, 0)
+        fallback_idx = global_tokens_safe.new_empty(B, 0)
+
+        if G > 0:
+            global_scores = token_scores.gather(1, global_tokens_safe).masked_fill(~valid_global, neg_large)
+            global_order = torch.argsort(global_scores, dim=1, descending=True)
+            sorted_global_idx = global_tokens_safe.gather(1, global_order)
+            sorted_global_valid = valid_global.gather(1, global_order)
+            sorted_global_idx = sorted_global_idx.masked_fill(~sorted_global_valid, -1)
+
+            carried_idx = sorted_global_idx[:, :carry_k]
+            fallback_idx = sorted_global_idx[:, carry_k:]
+
+        current_global_mask = torch.zeros(B, L, dtype=torch.bool, device=device)
+        if G > 0:
+            current_global_mask.scatter_(1, global_tokens_safe, valid_global)
+
+        candidate_scores = token_scores.masked_fill(
+            current_global_mask,
+            neg_large,
+        )
+
+        discover_k = min(self.next_global_k, L)
+        discovered_idx = torch.topk(candidate_scores, k=discover_k, dim=-1).indices
+
+        candidate_count = (~current_global_mask).sum(dim=1)
+        rank = torch.arange(discover_k, device=device).unsqueeze(0)
+        discovered_valid = rank < candidate_count.unsqueeze(1)
+        discovered_idx = discovered_idx.masked_fill(~discovered_valid, -1)
+
+        next_global_idx = torch.cat((carried_idx, discovered_idx, fallback_idx), dim=1)
+        next_global_idx = self._pack_valid_tokens(next_global_idx)
+        return self._pad_selected_tokens(next_global_idx, self.next_global_k)
+
+    def forward(self, x, global_tokens_idx=None, return_next_global: bool = False):
         # x: [B, L, d_model]
         B, L, _ = x.shape
 
         # global indices must be valid for current sequence length.
-        global_tokens = self.global_tokens.to(x.device) # [B,G]
+        global_tokens = self._resolve_global_tokens(global_tokens_idx, B, x.device)  # [B, G]
 
         valid_global = (global_tokens >= 0) & (global_tokens < L)  # [B, G] (bool)
         global_tokens_safe = global_tokens.masked_fill(~valid_global, 0)
@@ -109,18 +199,22 @@ class sparseAttention(nn.Module):
             scores_for_softmax = scores_global.masked_fill(~valid_query, 0.0)
             probs_global = torch.softmax(scores_for_softmax, dim=-1) * valid_query.to(scores_global.dtype)
             global_values = torch.einsum("bhgl,bhld->bhgd", probs_global, v)
+            next_global_idx = self._select_next_global_tokens(probs_global, global_tokens_safe, valid_global)
 
             global_out = torch.zeros_like(q)
             global_out.scatter_add_(dim=2, index=idx_global, src=global_values)
-            return global_out
+            return global_out, next_global_idx
 
         # CPU path: keep sequential execution.
         if not x.is_cuda:
             local_out = run_local_attention()
-            global_out = run_global_attention()
+            global_out, next_global_idx = run_global_attention()
             A = torch.where(global_mask.unsqueeze(1).unsqueeze(-1), global_out, local_out)
             out = A.transpose(1, 2).reshape(B, L, self.h * self.d_h)
-            return out @ self.w_0
+            out = out @ self.w_0
+            if return_next_global:
+                return out, next_global_idx
+            return out
 
         # CUDA path: run local and global blocks on separate streams for async computation.
         current_stream = torch.cuda.current_stream(device=x.device)
@@ -129,6 +223,7 @@ class sparseAttention(nn.Module):
 
         local_out = None
         global_out = None
+        next_global_idx = None
 
         local_stream.wait_stream(current_stream)
         with torch.cuda.stream(local_stream):
@@ -136,7 +231,7 @@ class sparseAttention(nn.Module):
 
         global_stream.wait_stream(current_stream)
         with torch.cuda.stream(global_stream):
-            global_out = run_global_attention()
+            global_out, next_global_idx = run_global_attention()
 
         current_stream.wait_stream(local_stream)
         current_stream.wait_stream(global_stream)
@@ -144,7 +239,10 @@ class sparseAttention(nn.Module):
         A = torch.where(global_mask.unsqueeze(1).unsqueeze(-1), global_out, local_out)
 
         out = A.transpose(1, 2).reshape(B, L, self.h * self.d_h)
-        return out @ self.w_0
+        out = out @ self.w_0
+        if return_next_global:
+            return out, next_global_idx
+        return out
 
 
 
@@ -208,7 +306,7 @@ class SwiGLUFFN(nn.Module):
         dropout=0.0
     ):
         super().__init__()
-        self.w = nn.parameter(torch.randn(d_model, d_ff*2))
+        self.w = nn.Parameter(torch.randn(d_model, d_ff*2))
         self.w_out = nn.Linear(d_ff, d_model)
         self.dropout = nn.Dropout(dropout)
 
@@ -220,7 +318,7 @@ class SwiGLUFFN(nn.Module):
         return self.w_out(x)    # [B, L, d_model]
 
 
-class sparseTransformerLayer(nn.module):
+class sparseTransformerLayer(nn.Module):
     def __init__(
         self,
         # Attention params
@@ -228,6 +326,8 @@ class sparseTransformerLayer(nn.module):
         w: int,
         global_tokens: torch.Tensor,
         dilation: int,
+        next_global_k: int = 0,
+        carryover_global_k: int = 0,
         # MLP params
         dropout: float = 0.0,
         hidden_ratio: float = 7/3
@@ -237,7 +337,9 @@ class sparseTransformerLayer(nn.module):
             d_model = d_model,
             w = w,
             global_tokens_idx = global_tokens,
-            dilation = dilation
+            dilation = dilation,
+            next_global_k = next_global_k,
+            carryover_global_k = carryover_global_k,
         )
 
         hidden_dim = int(hidden_ratio * d_model)
@@ -249,15 +351,22 @@ class sparseTransformerLayer(nn.module):
         self.norm1 = nn.RMSNorm(d_model)
         self.norm2 = nn.RMSNorm(d_model)
 
-    def forward(self, x):
+    def forward(self, x, global_tokens_idx=None, return_next_global: bool = False):
         #   Sublayer 1 (Attention)
         sub1 = self.norm1(x)
-        sub1 = self.sparseAttention(sub1)
-        sub1 = x + self.residual1(sub1)
+        attn_out = self.sparseAttention(
+            sub1,
+            global_tokens_idx=global_tokens_idx,
+            return_next_global=return_next_global,
+        )
+        next_global_idx = None
+        if return_next_global:
+            attn_out, next_global_idx = attn_out
+        sub1 = x + self.residual1(attn_out)
         #   Sublayer 2 (FFN)
-        sub2 = self.norm2(sub2)
+        sub2 = self.norm2(sub1)
         sub2 = self.FFN(sub2)
-        sub2 = self.residual2(sub2)
-        return sub2 + sub1
-
-
+        sub2 = sub1 + self.residual2(sub2)
+        if return_next_global:
+            return sub2, next_global_idx
+        return sub2
