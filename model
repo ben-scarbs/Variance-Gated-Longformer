@@ -7,6 +7,7 @@ import math
 import torch
 from torch import nn
 import torch.nn.functional as F
+from transformers import RobertaModel
 
 
 def _resolve_batch_padding_mask(padding_mask, batch_size, seq_len, device):
@@ -40,10 +41,10 @@ def _resolve_batch_padding_mask(padding_mask, batch_size, seq_len, device):
 class sparseAttention(nn.Module):
     def __init__(
         self,
-        d_model: int = 512,  # embedding dim
+        d_model: int = 768,  # embedding dim
         w: int = 128,  # local sparse window size (excludes global tokens)
-        h: int = 8,  # number of heads; ALWAYS d_model % h == 0
-        global_tokens_idx: torch.Tensor = torch.zeros(1,1, dtype=torch.long),  # absolute global token indices
+        h: int = 12,  # number of heads; ALWAYS d_model % h == 0
+        global_tokens_idx = None,  # absolute global token indices
         dilation: int = 1,  # dilation step for sparse margins
         next_global_k: int = 0,  # number of global tokens to route to the next layer
         carryover_global_k: int = 0,  # number of current globals to preserve into the next layer
@@ -398,19 +399,18 @@ class SwiGLUFFN(nn.Module):
         return self.w_out(x)    # [B, L, d_model]
 
 
-class sparseTransformerLayer(nn.Module):
+class sparse_transformer_layer(nn.Module):
     def __init__(
         self,
         # Attention params
-        d_model: int,
         w: int,
-        global_tokens: torch.Tensor,
         dilation: int,
+        global_tokens = None,
+        d_model: int = 768,
         next_global_k: int = 0,
         carryover_global_k: int = 0,
-        # MLP params
+        # FFN params
         dropout: float = 0.0,
-        hidden_ratio: float = 7/3
     ):
         super().__init__()
         self.sparseAttention = sparseAttention(
@@ -419,11 +419,10 @@ class sparseTransformerLayer(nn.Module):
             global_tokens_idx = global_tokens,
             dilation = dilation,
             next_global_k = next_global_k,
-            carryover_global_k = carryover_global_k,
+            carryover_global_k = carryover_global_k
         )
 
-        hidden_dim = int(hidden_ratio * d_model)
-        self.FFN = SwiGLUFFN(d_model=d_model, d_ff=hidden_dim, dropout=dropout)
+        self.FFN = SwiGLUFFN(d_model=d_model, d_ff=3072, dropout=dropout)
 
         self.residual1 = VarGatedResidual()
         self.residual2 = VarGatedResidual()
@@ -452,3 +451,91 @@ class sparseTransformerLayer(nn.Module):
         if return_next_global:
             return sub2, next_global_idx
         return sub2
+
+class sparse_transformer_model(nn.Module):
+    def __init__(
+            self,
+            vocab_size: int = 50265,
+            d_model: int = 768,
+            max_tokens_factor: int = 2,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.roberta = RobertaModel.from_pretrained("roberta-base")
+        self.roberta_state_dict = self.roberta.state_dict()
+        self.max_positional_embeddings = self.roberta.embeddings.position_embeddings.weight.size(0) * max_tokens_factor
+
+        #   Embedding Layer
+        self.embeddings = nn.Embedding(vocab_size, d_model)
+
+        self.embeddings.weight.data.copy_(
+            self.roberta.embeddings.word_embeddings.weight.data
+        )
+
+        #   Positional Embedding Layer
+        self.positional_embeddings = nn.Embedding(self.max_positional_embeddings, d_model)
+
+        interpolated_positional_embeddings = F.interpolate(
+            self.roberta.embeddings.position_embeddings.weight.unsqueeze(0).transpose(1,2),
+            size=self.max_positional_embeddings,
+            mode='linear',
+            align_corners=True
+        ).transpose(1,2).squeeze(0)
+
+        self.positional_embeddings.weight.data = interpolated_positional_embeddings
+
+        #   Transforner Layers
+        self.transformer_params = {
+            "w": [32, 48, 64, 80, 96, 112, 128, 144, 168, 192, 256, 1028],
+            "dilation": [1, 1, 1, 2, 2, 2, 2, 4, 4, 4, 4, 1],
+            "globals": [torch.Tensor([0, 1]), None, None, None, None, None, None, None, None, None, None, None],
+            "next": [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 0],
+            "carryover": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 0]
+        }
+
+        self.transformer_layers = nn.ModuleList([
+            sparse_transformer_layer(
+                w = self.transformer_params["w"][i],
+                dilation = self.transformer_params["dilation"][i],
+                global_tokens = self.transformer_params["globals"][i],
+                next_global_k = self.transformer_params["next"][i],
+                carryover_global_k = self.transformer_params["carryover"][i]
+            ) for i in range(12)
+        ])
+
+        def pack_roberta_qkv(self, layer_i):
+            roberta_q = self.roberta_state_dict[f"roberta.encoder.layer.{i}.attention.self.query.weight"]
+            roberta_k = self.roberta_state_dict[f"roberta.encoder.layer.{i}.attention.self.key.weight"]
+            roberta_v = self.roberta_state_dict[f"roberta.encoder.layer.{i}.attention.self.value.weight"]
+
+            return torch.cat([roberta_q, roberta_k, roberta_v], dim=0)
+
+        for i, layer in enumerate(self.transformer_layers):
+            layer.sparseAttention.w_qkv = self.pack_roberta_qkv(self, i)
+            layer.sparseAttention.w_0 = self.roberta_state_dict[f"roberta.encoder.layer.{i}.attention.output.dense.bias"]
+
+    def forward(self, x, global_tokens_idx=None, padding_mask=None):
+        #   Embedding Layer
+        x = self.embeddings(x)
+
+        #   Positional Embedding Layer
+        x = x + self.positional_embeddings(x)
+
+        #   Transformer Layers
+        next_globals = global_tokens_idx
+        for i in range(11):
+            x, next_globals = self.transformer_layers[i](
+                x,
+                global_tokens_idx=next_globals,
+                padding_mask=padding_mask,
+                return_next_global=True
+            )
+        x = self.transformer_layers[-1](
+            x,
+            global_tokens_idx=next_globals,
+            padding_mask=padding_mask,
+            return_next_global=False
+        )
+        return x
+
+model = torch.compile(sparse_transformer_model())
